@@ -85,7 +85,6 @@ Follow the browser prompt if the web-based flow appears. Only needed once per ma
 ### Step 2 — Build and Start the Containers
 
 ```powershell
-cd "C:\Users\laeeq\OneDrive\Desktop\Preprocess_Placement"
 docker compose up --build -d
 ```
 
