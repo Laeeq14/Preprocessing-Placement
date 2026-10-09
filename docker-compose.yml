@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------------------
+# Adaptive Preprocessing Placement — Docker Compose
+# ---------------------------------------------------------------------------
+# Services
+#   source       : source node (port 8000) — placement decision + optional preprocessing
+#   destination  : destination node (port 8001) — optional preprocessing + inference
+#
+# Network
+#   pipeline_net : isolated bridge network between the two endpoints
+#                  Network shaping (tc-netem/tbf) is applied inside the
+#                  source container on the eth0 interface via scripts/shape_network.sh
+#
+# Volumes
+#   ./shared     : mounts placement_policy.py into source at /shared
+#   ./data/images: COCO images (or any test images) available to the experiment runner
+# ---------------------------------------------------------------------------
+
+networks:
+  pipeline_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+services:
+  destination:
+    build:
+      context: ./docker/destination
+      dockerfile: Dockerfile
+    container_name: destination
+    networks:
+      pipeline_net:
+        ipv4_address: 172.28.0.10
+    ports:
+      - "8001:8001"
+    environment:
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    # Allow model download on first run (remove after caching)
+    volumes:
+      - model_cache:/root/.cache
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  source:
+    build:
+      context: ./docker/source
+      dockerfile: Dockerfile
+    container_name: source
+    networks:
+      pipeline_net:
+        ipv4_address: 172.28.0.20
+    ports:
+      - "8000:8000"
+    environment:
+      DEST_URL: "http://destination:8001"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      SWITCHING_MARGIN: "${SWITCHING_MARGIN:-0.05}"
+      EMA_ALPHA: "${EMA_ALPHA:-0.3}"
+    volumes:
+      - ./shared:/shared:ro          # placement_policy.py
+      - ./data/images:/data/images:ro  # test images
+    # NET_ADMIN required for tc-netem network shaping inside the container
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      destination:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  model_cache:
