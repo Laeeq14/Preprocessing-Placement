@@ -114,6 +114,20 @@ class PlacementPolicy:
     # Decision
     # ------------------------------------------------------------------
 
+    def estimate(
+        self,
+        raw_size_bytes: int,
+        preprocessed_size_bytes: int,
+    ) -> tuple[float, float, float]:
+        """Compute estimated costs (source, dest, bw_bps) without modifying decision state."""
+        with self._lock:
+            bw = self._bandwidth_ema or 1_000_000
+            src_t = self._src_preprocess_ema or self.src_preprocess_default_s
+            dst_t = self._dst_preprocess_ema or self.dst_preprocess_default_s
+        cost_source = src_t + (preprocessed_size_bytes / bw)
+        cost_dest = (raw_size_bytes / bw) + dst_t
+        return cost_source, cost_dest, bw
+
     def decide(
         self,
         raw_size_bytes: int,
@@ -133,14 +147,11 @@ class PlacementPolicy:
         -------
         CostEstimate with .decision == "source" or "destination".
         """
+        cost_source, cost_dest, bw = self.estimate(raw_size_bytes, preprocessed_size_bytes)
         with self._lock:
-            bw = self._bandwidth_ema or 1_000_000  # 1 MB/s fallback
             src_t = self._src_preprocess_ema or self.src_preprocess_default_s
             dst_t = self._dst_preprocess_ema or self.dst_preprocess_default_s
             last = self._last_decision
-
-        cost_source = src_t + (preprocessed_size_bytes / bw)
-        cost_dest = (raw_size_bytes / bw) + dst_t
 
         # Apply switching margin to the *current* path to dampen oscillation
         effective_cost_source = cost_source

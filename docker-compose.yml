@@ -38,6 +38,7 @@ services:
     # Allow model download on first run (remove after caching)
     volumes:
       - model_cache:/root/.cache
+      - ./docker/destination/destination_node.py:/app/destination_node.py:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 10s
@@ -62,8 +63,10 @@ services:
       SWITCHING_MARGIN: "${SWITCHING_MARGIN:-0.05}"
       EMA_ALPHA: "${EMA_ALPHA:-0.3}"
     volumes:
-      - ./shared:/shared:ro          # placement_policy.py
+      - ./shared:/shared:ro            # placement_policy.py
       - ./data/images:/data/images:ro  # test images
+      - ./scripts:/scripts:ro          # shape_network.sh → /scripts/shape_network.sh
+      - ./docker/source/source_node.py:/app/source_node.py:ro
     # NET_ADMIN required for tc-netem network shaping inside the container
     cap_add:
       - NET_ADMIN

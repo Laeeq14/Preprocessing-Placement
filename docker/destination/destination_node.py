@@ -32,6 +32,9 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from PIL import Image
 
+# Pin PyTorch thread count to eliminate thread scheduling contention and inference variance
+torch.set_num_threads(2)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------

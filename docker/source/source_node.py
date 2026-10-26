@@ -29,6 +29,9 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image
 
+# Pin PyTorch thread count to reduce thread contention
+torch.set_num_threads(2)
+
 # Shared policy (mounted via Docker volume at /shared)
 import sys
 sys.path.insert(0, "/shared")
@@ -64,6 +67,50 @@ policy = PlacementPolicy(
     switching_margin=float(os.getenv("SWITCHING_MARGIN", "0.05")),
     ema_alpha=float(os.getenv("EMA_ALPHA", "0.3")),
 )
+_policy_warmed = False
+_WARMUP_IMAGES = int(os.getenv("WARMUP_IMAGES", "5"))  # local preprocess runs at startup
+
+
+def _warm_policy_once() -> None:
+    """
+    Seed the EMA with measurements from the destination /profile endpoint
+    (dst preprocess + inference averages) and a few local trial preprocesses
+    on a small synthetic image.  Runs at most once per process lifetime.
+    """
+    global _policy_warmed
+    if _policy_warmed:
+        return
+    _policy_warmed = True
+
+    # Seed dst preprocess + inference times from destination profile
+    try:
+        resp = requests.get(f"{DEST_URL}/profile", timeout=5)
+        if resp.ok:
+            data = resp.json()
+            prep_ms = (data.get("preprocess") or {}).get("mean_ms") or None
+            infer_ms = (data.get("inference") or {}).get("mean_ms") or None
+            if prep_ms:
+                policy.update_dst_preprocess_time(prep_ms / 1000.0)
+                logger.info("[warmup] dst preprocess from /profile: %.2f ms", prep_ms)
+            if infer_ms:
+                logger.info("[warmup] dst inference from /profile: %.2f ms", infer_ms)
+    except Exception as exc:
+        logger.warning("[warmup] Could not reach destination /profile: %s", exc)
+
+    # Seed src preprocess time from local trials on a tiny synthetic image
+    import numpy as np
+    from PIL import Image as PILImage
+    _syn = PILImage.fromarray(
+        (np.random.randint(0, 256, (256, 256, 3), dtype=np.uint8))
+    )
+    times = []
+    for _ in range(_WARMUP_IMAGES):
+        t0 = time.perf_counter()
+        TRANSFORM(_syn)
+        times.append(time.perf_counter() - t0)
+    avg = sum(times) / len(times)
+    policy.update_src_preprocess_time(avg)
+    logger.info("[warmup] src preprocess from %d trials: %.2f ms", _WARMUP_IMAGES, avg * 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -125,17 +172,15 @@ async def process_image(
     src_preprocess_time = 0.0
     decision = mode
 
-    # --- Adaptive decision ---
+    # Warm the EMA once from /profile + local timing trials (no per-image probe)
+    _warm_policy_once()
+    preprocessed_size = raw_size * 4  # float32 tensor ≈ 4× raw JPEG in bytes
+
+    # Compute cost model predictions for both paths
+    cost_src, cost_dst, bw_est = policy.estimate(raw_size, preprocessed_size)
+
+    # --- Adaptive decision / Mode assignment ---
     if mode == "adaptive":
-        # Do a trial preprocess to measure local time and estimate payload size
-        t_p = time.perf_counter()
-        tensor = preprocess(img)
-        src_preprocess_time = time.perf_counter() - t_p
-        policy.update_src_preprocess_time(src_preprocess_time)
-
-        preprocessed_bytes = tensor_to_bytes(tensor)
-        preprocessed_size = len(preprocessed_bytes)
-
         estimate = policy.decide(
             raw_size_bytes=raw_size,
             preprocessed_size_bytes=preprocessed_size,
@@ -145,19 +190,25 @@ async def process_image(
             "src_cost_s": estimate.source_cost_s,
             "dst_cost_s": estimate.dest_cost_s,
             "bw_kbps": estimate.bandwidth_bps / 1024,
+            "pred_decision": estimate.decision,
         }
     else:
-        preprocessed_bytes = None
-        policy_meta = {}
+        decision = mode
+        policy_meta = {
+            "src_cost_s": cost_src,
+            "dst_cost_s": cost_dst,
+            "bw_kbps": bw_est / 1024,
+            "pred_decision": "source" if cost_src <= cost_dst else "destination",
+        }
 
     # --- Execute chosen path ---
     if decision == "source":
-        # Preprocess locally if not already done
-        if preprocessed_bytes is None:
-            t_p = time.perf_counter()
-            tensor = preprocess(img)
-            src_preprocess_time = time.perf_counter() - t_p
-            preprocessed_bytes = tensor_to_bytes(tensor)
+        # Preprocess locally
+        t_p = time.perf_counter()
+        tensor = preprocess(img)
+        src_preprocess_time = time.perf_counter() - t_p
+        policy.update_src_preprocess_time(src_preprocess_time)
+        preprocessed_bytes = tensor_to_bytes(tensor)
 
         payload = preprocessed_bytes
         t_tx_start = time.perf_counter()
@@ -182,10 +233,22 @@ async def process_image(
         if "preprocess_time_s" in dest_result:
             policy.update_dst_preprocess_time(dest_result["preprocess_time_s"])
 
-    # Update bandwidth estimate
-    policy.update_bandwidth(bytes_transferred, transfer_time)
-
     total_time = time.perf_counter() - t_start
+
+    # Derive wire-only transfer time: subtract destination compute from round-trip
+    dst_preprocess = dest_result.get("preprocess_time_s", 0.0) or 0.0
+    dst_infer      = dest_result.get("infer_time_s", 0.0) or 0.0
+    raw_wire_time  = transfer_time - dst_preprocess - dst_infer
+    if raw_wire_time <= 0:
+        logger.warning(
+            "Non-positive raw wire time: %.4fs (transfer=%.4f, dst_prep=%.4f, dst_infer=%.4f)",
+            raw_wire_time, transfer_time, dst_preprocess, dst_infer,
+        )
+    wire_time = max(0.0005, raw_wire_time)
+
+    # Update bandwidth estimate using wire-only time to avoid contaminating
+    # network speed estimates with destination inference time
+    policy.update_bandwidth(bytes_transferred, wire_time)
 
     return JSONResponse({
         "decision": decision,
@@ -194,6 +257,7 @@ async def process_image(
         "bytes_transferred": bytes_transferred,
         "src_preprocess_time_s": src_preprocess_time,
         "transfer_time_s": transfer_time,
+        "wire_time_s": wire_time,
         "total_time_s": total_time,
         "policy": policy_meta,
         "destination": dest_result,
