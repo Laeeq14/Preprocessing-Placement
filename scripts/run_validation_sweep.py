@@ -9,14 +9,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 BANDWIDTHS = [5000, 2000, 1000, 500, 256]
 N_IMAGES = 20
-OUTPUT_CSV = "results/validation_sweep_20.csv"
+OUTPUT_CSV = REPO_ROOT / "results" / "validation_sweep_20.csv"
+RUN_EXP_SCRIPT = REPO_ROOT / "scripts" / "run_experiment.py"
 
 def main():
-    out_file = Path(OUTPUT_CSV)
-    if out_file.exists():
-        out_file.unlink()
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    if OUTPUT_CSV.exists():
+        OUTPUT_CSV.unlink()
 
     print(f"=== Starting 20-Image Cost-Model Validation Sweep ===")
     print(f"Bandwidths: {BANDWIDTHS} Kbps")
@@ -27,14 +29,14 @@ def main():
         print(f"\n>>>> Executing Bandwidth {bw} Kbps <<<<")
         cmd = [
             sys.executable,
-            "scripts/run_experiment.py",
+            str(RUN_EXP_SCRIPT),
             "--mode", "all",
             "--bw", str(bw),
             "--n", str(N_IMAGES),
             "--interleave",
-            "--output", OUTPUT_CSV,
+            "--output", str(OUTPUT_CSV),
         ]
-        res = subprocess.run(cmd)
+        res = subprocess.run(cmd, cwd=REPO_ROOT)
         if res.returncode != 0:
             print(f"ERROR: Experiment runner exited with code {res.returncode}")
             sys.exit(res.returncode)

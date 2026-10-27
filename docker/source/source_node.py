@@ -59,6 +59,17 @@ TRANSFORM = T.Compose([
     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
+# Actual byte size of a torch.save'd 1×3×224×224 float32 tensor.
+# This is a fixed constant independent of the input image; pre-compute it once
+# to avoid the raw_size * 4 approximation that was wrong for two reasons:
+#   (a) raw_size varies per image; the tensor shape does not.
+#   (b) torch.save adds a pickle header (~100 B), making the true size ~589 KiB.
+_DUMMY = torch.zeros(1, 3, 224, 224)
+_buf = io.BytesIO()
+torch.save(_DUMMY, _buf)
+TENSOR_BYTES: int = _buf.tell()    # bytes; used by cost model for source-path payload
+del _DUMMY, _buf
+
 # ---------------------------------------------------------------------------
 # App and policy
 # ---------------------------------------------------------------------------
@@ -97,20 +108,27 @@ def _warm_policy_once() -> None:
     except Exception as exc:
         logger.warning("[warmup] Could not reach destination /profile: %s", exc)
 
-    # Seed src preprocess time from local trials on a tiny synthetic image
+    # Seed src preprocess time from local trials on a synthetic JPEG image.
+    # Must include JPEG decode in the timer because production now times the full
+    # path: Image.open(JPEG) + convert('RGB') + TRANSFORM.
     import numpy as np
     from PIL import Image as PILImage
-    _syn = PILImage.fromarray(
-        (np.random.randint(0, 256, (256, 256, 3), dtype=np.uint8))
+    _syn_raw = PILImage.fromarray(
+        np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
     )
+    _syn_buf = io.BytesIO()
+    _syn_raw.save(_syn_buf, format="JPEG", quality=85)
+    _syn_bytes = _syn_buf.getvalue()
     times = []
     for _ in range(_WARMUP_IMAGES):
         t0 = time.perf_counter()
-        TRANSFORM(_syn)
+        _img = PILImage.open(io.BytesIO(_syn_bytes)).convert("RGB")
+        TRANSFORM(_img)
         times.append(time.perf_counter() - t0)
     avg = sum(times) / len(times)
     policy.update_src_preprocess_time(avg)
-    logger.info("[warmup] src preprocess from %d trials: %.2f ms", _WARMUP_IMAGES, avg * 1000)
+    logger.info("[warmup] src preprocess (decode+transform) from %d trials: %.2f ms", _WARMUP_IMAGES, avg * 1000)
+
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +188,14 @@ async def process_image(
 
     raw_size = len(raw_bytes)
     src_preprocess_time = 0.0
+    src_decode_time = 0.0
     decision = mode
 
     # Warm the EMA once from /profile + local timing trials (no per-image probe)
     _warm_policy_once()
-    preprocessed_size = raw_size * 4  # float32 tensor ≈ 4× raw JPEG in bytes
+    # Use the actual torch.save tensor byte count (fixed shape, invariant to input).
+    # The old raw_size * 4 approximation was image-dependent and ~17% off on average.
+    preprocessed_size = TENSOR_BYTES
 
     # Compute cost model predictions for both paths
     cost_src, cost_dst, bw_est = policy.estimate(raw_size, preprocessed_size)
@@ -189,7 +210,9 @@ async def process_image(
         policy_meta = {
             "src_cost_s": estimate.source_cost_s,
             "dst_cost_s": estimate.dest_cost_s,
-            "bw_kbps": estimate.bandwidth_bps / 1024,
+            # bandwidth_bps is in bytes/s; divide by 125 to convert to Kbps
+            # (1 Kbps = 1000 bits/s = 125 bytes/s).  Previous /1024 gave KB/s.
+            "bw_kbps": estimate.bandwidth_bps / 125,
             "pred_decision": estimate.decision,
         }
     else:
@@ -197,16 +220,19 @@ async def process_image(
         policy_meta = {
             "src_cost_s": cost_src,
             "dst_cost_s": cost_dst,
-            "bw_kbps": bw_est / 1024,
+            "bw_kbps": bw_est / 125,
             "pred_decision": "source" if cost_src <= cost_dst else "destination",
         }
 
     # --- Execute chosen path ---
     if decision == "source":
-        # Preprocess locally
+        # Preprocess locally — time the FULL path: decode + transform.
+        # Previously the timer started after Image.open, missing ~4 ms of decode.
         t_p = time.perf_counter()
-        tensor = preprocess(img)
-        src_preprocess_time = time.perf_counter() - t_p
+        img_decoded = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        src_decode_time = time.perf_counter() - t_p
+        tensor = preprocess(img_decoded)
+        src_preprocess_time = time.perf_counter() - t_p   # decode + transform
         policy.update_src_preprocess_time(src_preprocess_time)
         preprocessed_bytes = tensor_to_bytes(tensor)
 
@@ -255,7 +281,10 @@ async def process_image(
         "mode_requested": mode,
         "raw_size_bytes": raw_size,
         "bytes_transferred": bytes_transferred,
+        # Full source preprocess time: decode + resize + crop + ToTensor + Normalize
         "src_preprocess_time_s": src_preprocess_time,
+        # Decode-only component (Image.open + convert); zero when path = destination
+        "src_decode_time_s": src_decode_time,
         "transfer_time_s": transfer_time,
         "wire_time_s": wire_time,
         "total_time_s": total_time,

@@ -195,7 +195,8 @@ class PlacementPolicy:
             return {
                 "decisions_made": self.decisions_made,
                 "switches": self.switches,
-                "bandwidth_ema_kbps": (self._bandwidth_ema or 0) / 1024,
+                # bandwidth_ema is stored in bytes/s; ÷125 → Kbps (1 Kbps = 125 B/s)
+                "bandwidth_ema_kbps": (self._bandwidth_ema or 0) / 125,
                 "src_preprocess_ema_ms": (self._src_preprocess_ema or 0) * 1000,
                 "dst_preprocess_ema_ms": (self._dst_preprocess_ema or 0) * 1000,
                 "last_decision": self._last_decision,
