@@ -7,7 +7,7 @@ Endpoints
 ---------
 POST /process
     Accepts a JPEG/PNG image upload.
-    Query param ?mode=adaptive|source|destination controls placement.
+    Query param ?mode=adaptive|source_thumbnail|destination|source controls placement.
     Returns timing breakdown and inference result from destination.
 
 GET /health     Liveness probe.
@@ -60,15 +60,11 @@ TRANSFORM = T.Compose([
     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-# Actual byte size of a torch.save'd 1×3×224×224 float32 tensor.
-# This is a fixed constant independent of the input image; pre-compute it once
-# to avoid the raw_size * 4 approximation that was wrong for two reasons:
-#   (a) raw_size varies per image; the tensor shape does not.
-#   (b) torch.save adds a pickle header (~100 B), making the true size ~589 KiB.
+# Actual byte size of a torch.save'd 1×3×224×224 float32 tensor (Phase A).
 _DUMMY = torch.zeros(1, 3, 224, 224)
 _buf = io.BytesIO()
 torch.save(_DUMMY, _buf)
-TENSOR_BYTES: int = _buf.tell()    # bytes; used by cost model for source-path payload
+TENSOR_BYTES: int = _buf.tell()    # bytes; used by cost model for source-path payload in Phase A
 del _DUMMY, _buf
 
 # ---------------------------------------------------------------------------
@@ -76,18 +72,18 @@ del _DUMMY, _buf
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Source Node", version="1.0.0")
 policy = PlacementPolicy(
+    pipeline=os.getenv("PIPELINE", "phase_b"),
     switching_margin=float(os.getenv("SWITCHING_MARGIN", "0.05")),
     ema_alpha=float(os.getenv("EMA_ALPHA", "0.3")),
 )
 _policy_warmed = False
-_WARMUP_IMAGES = int(os.getenv("WARMUP_IMAGES", "5"))  # local preprocess runs at startup
+_WARMUP_IMAGES = int(os.getenv("WARMUP_IMAGES", "2"))
 
 
 def _warm_policy_once() -> None:
     """
     Seed the EMA with measurements from the destination /profile endpoint
-    (dst preprocess + inference averages) and a few local trial preprocesses
-    on a small synthetic image.  Runs at most once per process lifetime.
+    and local trial preprocesses. Runs at most once per process lifetime.
     """
     global _policy_warmed
     if _policy_warmed:
@@ -102,34 +98,48 @@ def _warm_policy_once() -> None:
             prep_ms = (data.get("preprocess") or {}).get("mean_ms") or None
             infer_ms = (data.get("inference") or {}).get("mean_ms") or None
             if prep_ms:
-                policy.update_dst_preprocess_time(prep_ms / 1000.0)
+                if policy.pipeline == "phase_b":
+                    policy.update_dst_full_time(prep_ms / 1000.0)
+                else:
+                    policy.update_dst_preprocess_time(prep_ms / 1000.0)
                 logger.info("[warmup] dst preprocess from /profile: %.2f ms", prep_ms)
             if infer_ms:
                 logger.info("[warmup] dst inference from /profile: %.2f ms", infer_ms)
     except Exception as exc:
         logger.warning("[warmup] Could not reach destination /profile: %s", exc)
 
-    # Seed src preprocess time from local trials on a synthetic JPEG image.
-    # Must include JPEG decode in the timer because production now times the full
-    # path: Image.open(JPEG) + convert('RGB') + TRANSFORM.
-    import numpy as np
-    from PIL import Image as PILImage
-    _syn_raw = PILImage.fromarray(
-        np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
-    )
-    _syn_buf = io.BytesIO()
-    _syn_raw.save(_syn_buf, format="JPEG", quality=85)
-    _syn_bytes = _syn_buf.getvalue()
-    times = []
-    for _ in range(_WARMUP_IMAGES):
-        t0 = time.perf_counter()
-        _img = PILImage.open(io.BytesIO(_syn_bytes)).convert("RGB")
-        TRANSFORM(_img)
-        times.append(time.perf_counter() - t0)
-    avg = sum(times) / len(times)
-    policy.update_src_preprocess_time(avg)
-    logger.info("[warmup] src preprocess (decode+transform) from %d trials: %.2f ms", _WARMUP_IMAGES, avg * 1000)
-
+    if policy.pipeline == "phase_b":
+        if policy._dst_remain_ema is None:
+            policy.update_dst_remain_time(0.0008)
+        if policy._thumb_bytes_ema is None:
+            policy.update_thumb_bytes(20_484)
+        if policy._src_preprocess_ema is None:
+            policy.update_src_preprocess_time(0.765)
+        logger.info(
+            "[warmup] Phase B initialized: src=%.2f ms, dst_full=%.2f ms, dst_remain=%.2f ms, thumb=%d B",
+            (policy._src_preprocess_ema or 0) * 1000,
+            (policy._dst_preprocess_ema or 0) * 1000,
+            (policy._dst_remain_ema or 0) * 1000,
+            int(policy._thumb_bytes_ema or 0),
+        )
+    else:
+        import numpy as np
+        from PIL import Image as PILImage
+        _syn_raw = PILImage.fromarray(
+            np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+        )
+        _syn_buf = io.BytesIO()
+        _syn_raw.save(_syn_buf, format="JPEG", quality=85)
+        _syn_bytes = _syn_buf.getvalue()
+        times = []
+        for _ in range(_WARMUP_IMAGES):
+            t0 = time.perf_counter()
+            _img = PILImage.open(io.BytesIO(_syn_bytes)).convert("RGB")
+            TRANSFORM(_img)
+            times.append(time.perf_counter() - t0)
+        avg = sum(times) / len(times)
+        policy.update_src_preprocess_time(avg)
+        logger.info("[warmup] Phase A src preprocess from %d trials: %.2f ms", _WARMUP_IMAGES, avg * 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -169,14 +179,15 @@ def _post_to_dest(path: str, data: bytes, headers: dict) -> dict:
 @app.post("/process")
 async def process_image(
     file: UploadFile = File(...),
-    mode: str = Query("adaptive", description="adaptive | source | destination"),
+    mode: str = Query("adaptive", description="adaptive | source_thumbnail | destination | source"),
 ):
     """
     Process one image through the pipeline.
 
-    mode=adaptive  : policy decides where to preprocess
-    mode=source    : always preprocess at source (baseline A)
-    mode=destination : always preprocess at destination (baseline B)
+    mode=adaptive        : policy decides where to preprocess (source_thumbnail vs destination in Phase B)
+    mode=source_thumbnail: always preprocess to thumbnail at source (Phase B)
+    mode=destination     : always preprocess at destination
+    mode=source          : always preprocess to tensor at source (Phase A)
     """
     t_start = time.perf_counter()
 
@@ -192,14 +203,15 @@ async def process_image(
     src_decode_time = 0.0
     decision = mode
 
-    # Warm the EMA once from /profile + local timing trials (no per-image probe)
+    # Warm the EMA once from profile + baseline defaults
     _warm_policy_once()
-    # Use the actual torch.save tensor byte count (fixed shape, invariant to input).
-    # The old raw_size * 4 approximation was image-dependent and ~17% off on average.
-    preprocessed_size = TENSOR_BYTES
+
+    # Preprocessed payload size estimate
+    preprocessed_size = None if policy.pipeline == "phase_b" else TENSOR_BYTES
 
     # Compute cost model predictions for both paths
     cost_src, cost_dst, bw_est = policy.estimate(raw_size, preprocessed_size)
+    source_label = "source_thumbnail" if policy.pipeline == "phase_b" else "source"
 
     # --- Adaptive decision / Mode assignment ---
     if mode == "adaptive":
@@ -209,6 +221,7 @@ async def process_image(
         )
         decision = estimate.decision
         policy_meta = {
+            "pipeline": policy.pipeline,
             "src_cost_s": estimate.source_cost_s,
             "dst_cost_s": estimate.dest_cost_s,
             # bandwidth_bps is in bytes/s; divide by 125 to convert to Kbps
@@ -219,26 +232,25 @@ async def process_image(
     else:
         decision = mode
         policy_meta = {
+            "pipeline": policy.pipeline,
             "src_cost_s": cost_src,
             "dst_cost_s": cost_dst,
             "bw_kbps": bw_est / 125,
-            "pred_decision": "source" if cost_src <= cost_dst else "destination",
+            "pred_decision": source_label if cost_src <= cost_dst else "destination",
         }
 
     # --- Execute chosen path ---
     if decision == "source_thumbnail":
         # Phase B: decode full image, resize, re-encode as JPEG Q85 thumbnail (~20 KB),
         # then send the thumbnail to destination with X-Mode: raw.
-        # Destination decodes the thumbnail and applies its standard TRANSFORM
-        # (Resize256 → CenterCrop224 → ToTensor → Normalize) — the resize is a near-no-op
-        # because the thumbnail is already sized to ~256px on the short side.
         t_p = time.perf_counter()
         thumb_bytes = thumbnail_encode(raw_bytes)  # decode + resize256 + JPEG-Q85 encode
         src_preprocess_time = time.perf_counter() - t_p
         src_decode_time = src_preprocess_time  # full time attributed to source
+        policy.update_src_preprocess_time(src_preprocess_time)
+        policy.update_thumb_bytes(len(thumb_bytes))
 
         payload = thumb_bytes
-        t_tx_start = time.perf_counter()
         dest_result, transfer_time = _post_to_dest(
             "/infer",
             payload,
@@ -246,22 +258,21 @@ async def process_image(
         )
         bytes_transferred = len(payload)
 
+        # In thumbnail mode, destination's preprocess is the remainder (t_dst_remain)
         if "preprocess_time_s" in dest_result:
-            policy.update_dst_preprocess_time(dest_result["preprocess_time_s"])
+            policy.update_dst_remain_time(dest_result["preprocess_time_s"])
 
     elif decision == "source":
-        # Preprocess locally — time the FULL path: decode + transform.
-        # Previously the timer started after Image.open, missing ~4 ms of decode.
+        # Phase A legacy path: preprocess locally to tensor
         t_p = time.perf_counter()
         img_decoded = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
         src_decode_time = time.perf_counter() - t_p
         tensor = preprocess(img_decoded)
-        src_preprocess_time = time.perf_counter() - t_p   # decode + transform
+        src_preprocess_time = time.perf_counter() - t_p
         policy.update_src_preprocess_time(src_preprocess_time)
         preprocessed_bytes = tensor_to_bytes(tensor)
 
         payload = preprocessed_bytes
-        t_tx_start = time.perf_counter()
         dest_result, transfer_time = _post_to_dest(
             "/infer",
             payload,
@@ -270,8 +281,8 @@ async def process_image(
         bytes_transferred = len(payload)
 
     else:  # destination
+        # Destination runs full preprocessing
         payload = raw_bytes
-        t_tx_start = time.perf_counter()
         dest_result, transfer_time = _post_to_dest(
             "/infer",
             payload,
@@ -279,9 +290,12 @@ async def process_image(
         )
         bytes_transferred = raw_size
 
-        # Update dst preprocess time from destination's report
+        # Update dst full preprocess time from destination's report
         if "preprocess_time_s" in dest_result:
-            policy.update_dst_preprocess_time(dest_result["preprocess_time_s"])
+            if policy.pipeline == "phase_b":
+                policy.update_dst_full_time(dest_result["preprocess_time_s"])
+            else:
+                policy.update_dst_preprocess_time(dest_result["preprocess_time_s"])
 
     total_time = time.perf_counter() - t_start
 
@@ -294,12 +308,9 @@ async def process_image(
             "Non-positive raw wire time: %.4fs (transfer=%.4f, dst_prep=%.4f, dst_infer=%.4f)",
             raw_wire_time, transfer_time, dst_preprocess, dst_infer,
         )
-    # Report the raw derived wire time in the response (may be near-zero on loopback).
     wire_time = max(0.0, raw_wire_time)
 
-    # Update bandwidth estimate only when the wire time is plausible (> 1 ms).
-    # Clamping to a small floor (the old 0.0005 s) would inject fake ~GB/s readings
-    # into the EMA whenever destination compute exceeds measured round-trip time.
+    # Update bandwidth estimate when wire time is plausible (> 1 ms)
     if raw_wire_time > 0.001:
         policy.update_bandwidth(bytes_transferred, raw_wire_time)
     else:
@@ -311,11 +322,10 @@ async def process_image(
     return JSONResponse({
         "decision": decision,
         "mode_requested": mode,
+        "pipeline": policy.pipeline,
         "raw_size_bytes": raw_size,
         "bytes_transferred": bytes_transferred,
-        # Full source preprocess time: decode + resize + crop + ToTensor + Normalize
         "src_preprocess_time_s": src_preprocess_time,
-        # Decode-only component (Image.open + convert); zero when path = destination
         "src_decode_time_s": src_decode_time,
         "transfer_time_s": transfer_time,
         "wire_time_s": wire_time,
@@ -327,7 +337,7 @@ async def process_image(
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "source"}
+    return {"status": "ok", "service": "source", "pipeline": policy.pipeline}
 
 
 @app.get("/stats")
@@ -338,7 +348,7 @@ def stats():
 @app.post("/reset")
 def reset_policy():
     policy.reset()
-    return {"status": "reset"}
+    return {"status": "reset", "pipeline": policy.pipeline}
 
 
 # ---------------------------------------------------------------------------

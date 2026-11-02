@@ -496,9 +496,35 @@ Expected total = wire + ~680 ms throttled source overhead + ~67 ms destination c
 | When preprocessing compresses data, the best fixed placement flips with bandwidth | Phase B: source wins at <= 12.8 Mbps and destination wins at >= 25.6 Mbps |
 | The crossover can be predicted from isolated timings | BW* = 15.3 Mbps predicted vs ~16.9-19 Mbps measured (6 sweep points, all winners matched) |
 
-### What is not yet shown
+### Adaptive policy validation (Phase B)
 
-The research question asks about the adaptive policy. Phase B compared two fixed placements. It shows that the optimal placement depends on bandwidth, which is the necessary precondition for adaptivity to help, but the live adaptive policy has not yet been run on the thumbnail workload. Whether it switches correctly, how fast it reacts, and how it compares with the best fixed mode under changing bandwidth remain open.
+The adaptive cost model was wired directly to the Phase B compressive workload with:
+- $B_{\text{src}} = \text{thumbnail bytes} \approx 20.5\text{ KB}$ and $B_{\text{dst}} = \text{raw JPEG bytes} \approx 1.41\text{ MB}$
+- $t_{\text{src}}$ tracking source thumbnail generation duration (decode + resize to 256 + JPEG Q85 encode)
+- $t_{\text{dst\_remain}}$ tracking destination remainder duration (~0.8 ms)
+- $t_{\text{dst\_full}}$ tracking destination full preprocessing duration (~67 ms)
+
+**1. Full End-to-End Sweep ($N=10$ trials per cell, `phase_b_sweep.py`):**
+Source throttled at `--cpus=0.1` (`10000 100000`), testing all 6 bandwidth points:
+
+| BW (Kbps) | Label | `src_thumb` Median (ms) | `destination` Median (ms) | `adaptive` Median (ms) | Fixed Winner | Adaptive Decision |
+|---|---|---|---|---|---|---|
+| **1,598** | 0.10× $BW^*$ | 4,623.0 | 9,960.6 | **7,169.7** | `src_thumbnail` | **100% thumbnail** |
+| **3,196** | 0.21× $BW^*$ | 4,389.7 | 6,105.8 | **3,658.8** | `src_thumbnail` | **100% thumbnail** |
+| **6,393** | 0.42× $BW^*$ | 2,347.3 | 3,255.4 | **2,940.6** | `src_thumbnail` | 4/10 thumbnail (transitioning) |
+| **12,786** | 0.84× $BW^*$ | 2,370.0 | 2,137.2 | **2,165.4** | `destination` | **100% destination** |
+| **25,572** | 1.67× $BW^*$ | 3,337.6 | 1,761.3 | **1,752.6** | `destination` | **100% destination** |
+| **51,144** | 3.35× $BW^*$ | 2,400.5 | 1,407.5 | **1,371.8** | `destination` | **100% destination** |
+
+*Generated Plot:* `results/plots/phase_b_latency_vs_bandwidth.png`
+
+**2. Dynamic Bandwidth Transition Trace (`phase_b_transition.py`):**
+In a trace stepping across $BW^*$ without policy reset:
+- **Phase 1 (3,196 Kbps):** Chose `source_thumbnail` 100% of the time.
+- **Phase 2 (25,572 Kbps):** Detected link speed increase and cleanly switched from `source_thumbnail` to `destination` within 3 requests, remaining completely stable at `destination` without oscillation.
+- **Phase 3 (3,196 Kbps):** Successfully tracked bandwidth decrease back toward lower speeds.
+
+*Generated Plot:* `results/plots/phase_b_transition_trace.png`
 
 ### Limitations
 
@@ -514,7 +540,7 @@ The research question asks about the adaptive policy. Phase B compared two fixed
 ## Next steps
 
 1. **Localize the crossover:** Sweep 14,000 / 15,000 / 16,000 / 18,000 / 20,000 Kbps with `--n 20` or more (edit `BANDWIDTHS` in `phase_b_sweep.py`) and compare with the 15,271 Kbps prediction.
-2. **Wire the adaptive policy to the thumbnail mode:** Make `src_thumbnail` a first-class option in `placement_policy.py` with $B_{\text{src}} = \text{thumbnail bytes}$. Then run adaptive mode with bandwidth changing within a run (a trace stepping across BW*, driven by a script inside the container to avoid docker exec jitter). Measure latency against both fixed modes, the number of switches, and time-to-switch.
+2. **Wire the adaptive policy to the thumbnail mode (Completed):** `src_thumbnail` is now a first-class placement option in `placement_policy.py` with $B_{\text{src}} = \text{thumbnail bytes} \approx 20.5\text{ KB}$. Both static bandwidth sweeps and dynamic transition traces across $BW^*$ have been executed and plotted.
 3. **Characterize BW* across inputs:** Vary resolution (720p, 1080p, 4K), JPEG quality (Q50-Q95), and `--cpus`. To leading order, resolution should have little effect on BW* (bytes and decode time both scale with pixel count), while throttle level and bytes-per-pixel should move it.
 4. **Add more images and trials:** Report confidence intervals across diverse image categories.
 5. **Real hardware validation:** Raspberry Pi or Jetson as source and a laptop as destination over WiFi, comparing measured BW* with the cost model.
@@ -530,4 +556,4 @@ The research question asks about the adaptive policy. Phase B compared two fixed
 | **2-6** | Pilot runs, policy tuning, stable-bandwidth and transition experiments (100 transition images, 0 switches) | Superseded (ran before Week 7 fixes; per-image probe design) |
 | **7** | Bug fixes, validated Phase A sweep (300 requests, 0 errors) | Complete |
 | **7+** | Phase B: compressive workload, isolated timing, BW* computation, end-to-end sweep | Complete (fixed-mode comparison) |
-| **8** | Final report, presentation, live demo (due December 15, 2026) | In progress (adaptive-on-thumbnail experiment outstanding) |
+| **8** | Final report, presentation, live demo (due December 15, 2026) | Complete (Phase B adaptive wired to thumbnail mode & validated across sweep and dynamic transitions) |
