@@ -48,10 +48,13 @@ Preprocess_Placement/
 │   ├── run_validation_sweep.py      # Phase A validation sweep (5 BW x 3 modes)
 │   ├── validate_equivalence.py      # Verify source == destination output
 │   ├── analyze_results.py           # Summary statistics and plots
+│   ├── plot_phase_a_results.py      # Phase A: high-resolution presentation plots
 │   ├── measure_timing.py            # Phase B: per-role timing JSON
 │   ├── compute_bw_star.py           # Phase B: offline crossover (BW*) computation
 │   ├── sign_check.py                # Phase B: endpoint sanity check
-│   └── phase_b_sweep.py             # Phase B: end-to-end bandwidth sweep
+│   ├── phase_b_sweep.py             # Phase B: end-to-end bandwidth sweep
+│   ├── phase_b_transition.py        # Phase B: dynamic bandwidth transition experiment
+│   └── plot_phase_b_results.py      # Phase B: high-resolution presentation plots
 ├── data/
 │   ├── images/                      # COCO val2017 JPEGs (Phase A)
 │   ├── phase_b/                     # High-resolution test image(s) (Phase B)
@@ -172,10 +175,11 @@ This applies the bandwidth cap via `docker exec source bash /scripts/shape_netwo
 
 ```powershell
 py scripts/run_validation_sweep.py
+py scripts/plot_phase_a_results.py
 py scripts/analyze_results.py --input results/validation_sweep_20.csv --plots
 ```
 
-Plots are written to `results/plots/` (`latency_cdf.png`, `latency_vs_bandwidth.png`).
+Plots are written to `results/plots/` (`phase_a_latency_vs_bandwidth.png`, `phase_a_transition_trace.png`, `latency_vs_bandwidth.png`, `latency_cdf.png`).
 
 ### Phase B: measure, compute BW*, sweep
 
@@ -336,6 +340,15 @@ Setup: 5 bandwidths x 3 modes x 20 COCO images = 300 requests, 0 errors. Modes w
 | 256 | 19756.5 | 5291.2 | 5295.9 | 3.73x |
 
 Transfer sizes were 589.2 KB/image (source) and 157.0 KB/image (destination, adaptive). The adaptive policy chose destination on all 100 requests with 0 switches.
+
+*Generated Plot:* `results/plots/phase_a_latency_vs_bandwidth.png`
+
+**Dynamic Bandwidth Stepping & Policy Tracking Trace:**
+In the 100-request adaptive sweep across shaped bandwidth levels (5,000 -> 2,000 -> 1,000 -> 500 -> 256 Kbps):
+- **Decision Stability:** Chose `destination` 100% of the time (0 switches) because $B_{\text{dst}} < B_{\text{src}}$ throughout, avoiding 3.75× tensor inflation.
+- **Bandwidth Tracking:** The online policy EMA bandwidth estimate ($BW_{\text{est}}$) rapidly converged to each shaped rate limit.
+
+*Generated Plot:* `results/plots/phase_a_transition_trace.png`
 
 ### Observations
 
