@@ -80,6 +80,12 @@ services:
       retries: 5
       start_period: 15s
     restart: unless-stopped
+    # Phase B: throttle source to 10% of one CPU core (matches source_0.1.json)
+    # Remove or increase this for Phase A operation or higher throttle levels.
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
 
 volumes:
   model_cache:

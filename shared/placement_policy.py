@@ -1,4 +1,4 @@
-"""
+﻿"""
 placement_policy.py
 -------------------
 Adaptive preprocessing placement policy.
@@ -153,13 +153,15 @@ class PlacementPolicy:
             dst_t = self._dst_preprocess_ema or self.dst_preprocess_default_s
             last = self._last_decision
 
-        # Apply switching margin to the *current* path to dampen oscillation
+        # Apply switching margin to the *current* path to dampen oscillation.
+        # Discount the current path so the alternative must beat it by at least
+        # switching_margin before a switch occurs.
         effective_cost_source = cost_source
         effective_cost_dest = cost_dest
         if last == "source":
-            effective_cost_dest *= (1.0 - self.switching_margin)
-        else:
             effective_cost_source *= (1.0 - self.switching_margin)
+        else:
+            effective_cost_dest *= (1.0 - self.switching_margin)
 
         decision = "source" if effective_cost_source <= effective_cost_dest else "destination"
 

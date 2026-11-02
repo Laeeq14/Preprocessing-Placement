@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # shape_network.sh
 # ----------------
 # Apply or remove tc-netem + tc-tbf bandwidth shaping on the source
@@ -14,7 +14,7 @@
 #
 # Examples
 #   shape_network.sh set 1000          # 1 Mbps, no added delay
-#   shape_network.sh set 500 20 5      # 500 Kbps, 20ms Â± 5ms delay
+#   shape_network.sh set 500 20 5      # 500 Kbps, 20ms ± 5ms delay
 #   shape_network.sh clear             # remove all shaping
 #   shape_network.sh show              # display current qdiscs
 

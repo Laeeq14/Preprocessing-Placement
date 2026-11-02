@@ -30,12 +30,13 @@ from fastapi.responses import JSONResponse
 from PIL import Image
 
 # Pin PyTorch thread count to reduce thread contention
-torch.set_num_threads(2)
+torch.set_num_threads(1)  # Phase B: pinned to 1; note Phase A used 2 (not directly comparable)
 
 # Shared policy (mounted via Docker volume at /shared)
 import sys
 sys.path.insert(0, "/shared")
 from placement_policy import PlacementPolicy
+from phase_b_transforms import run_source_path as thumbnail_encode  # Phase B thumbnail pipeline
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -211,7 +212,7 @@ async def process_image(
             "src_cost_s": estimate.source_cost_s,
             "dst_cost_s": estimate.dest_cost_s,
             # bandwidth_bps is in bytes/s; divide by 125 to convert to Kbps
-            # (1 Kbps = 1000 bits/s = 125 bytes/s).  Previous /1024 gave KB/s.
+            # (1 Kbps = 1000 bits/s = 125 bytes/s).
             "bw_kbps": estimate.bandwidth_bps / 125,
             "pred_decision": estimate.decision,
         }
@@ -225,7 +226,30 @@ async def process_image(
         }
 
     # --- Execute chosen path ---
-    if decision == "source":
+    if decision == "source_thumbnail":
+        # Phase B: decode full image, resize, re-encode as JPEG Q85 thumbnail (~20 KB),
+        # then send the thumbnail to destination with X-Mode: raw.
+        # Destination decodes the thumbnail and applies its standard TRANSFORM
+        # (Resize256 → CenterCrop224 → ToTensor → Normalize) — the resize is a near-no-op
+        # because the thumbnail is already sized to ~256px on the short side.
+        t_p = time.perf_counter()
+        thumb_bytes = thumbnail_encode(raw_bytes)  # decode + resize256 + JPEG-Q85 encode
+        src_preprocess_time = time.perf_counter() - t_p
+        src_decode_time = src_preprocess_time  # full time attributed to source
+
+        payload = thumb_bytes
+        t_tx_start = time.perf_counter()
+        dest_result, transfer_time = _post_to_dest(
+            "/infer",
+            payload,
+            {"X-Mode": "raw", "Content-Type": "application/octet-stream"},
+        )
+        bytes_transferred = len(payload)
+
+        if "preprocess_time_s" in dest_result:
+            policy.update_dst_preprocess_time(dest_result["preprocess_time_s"])
+
+    elif decision == "source":
         # Preprocess locally — time the FULL path: decode + transform.
         # Previously the timer started after Image.open, missing ~4 ms of decode.
         t_p = time.perf_counter()
@@ -270,11 +294,19 @@ async def process_image(
             "Non-positive raw wire time: %.4fs (transfer=%.4f, dst_prep=%.4f, dst_infer=%.4f)",
             raw_wire_time, transfer_time, dst_preprocess, dst_infer,
         )
-    wire_time = max(0.0005, raw_wire_time)
+    # Report the raw derived wire time in the response (may be near-zero on loopback).
+    wire_time = max(0.0, raw_wire_time)
 
-    # Update bandwidth estimate using wire-only time to avoid contaminating
-    # network speed estimates with destination inference time
-    policy.update_bandwidth(bytes_transferred, wire_time)
+    # Update bandwidth estimate only when the wire time is plausible (> 1 ms).
+    # Clamping to a small floor (the old 0.0005 s) would inject fake ~GB/s readings
+    # into the EMA whenever destination compute exceeds measured round-trip time.
+    if raw_wire_time > 0.001:
+        policy.update_bandwidth(bytes_transferred, raw_wire_time)
+    else:
+        logger.debug(
+            "Skipping BW update: wire_time=%.4fs too small to be reliable",
+            raw_wire_time,
+        )
 
     return JSONResponse({
         "decision": decision,

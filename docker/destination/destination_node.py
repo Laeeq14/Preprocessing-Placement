@@ -33,7 +33,7 @@ from fastapi.responses import JSONResponse
 from PIL import Image
 
 # Pin PyTorch thread count to eliminate thread scheduling contention and inference variance
-torch.set_num_threads(2)
+torch.set_num_threads(1)  # Phase B: pinned to 1; note Phase A used 2 (not directly comparable)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -102,13 +102,17 @@ async def infer(request: Request):
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Could not deserialize tensor: {exc}")
     elif mode == "raw":
+        # Timer starts BEFORE decode so preprocess_time_s includes Image.open + convert
+        # (typically 4-8 ms). Previously the decode happened before the timer started,
+        # which understated destination cost and biased the placement policy toward
+        # choosing destination preprocessing.
+        t_p = time.perf_counter()
         try:
             img = Image.open(io.BytesIO(body)).convert("RGB")
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Invalid image: {exc}")
-        t_p = time.perf_counter()
         tensor = TRANSFORM(img)
-        preprocess_time_s = time.perf_counter() - t_p
+        preprocess_time_s = time.perf_counter() - t_p  # decode + transform
         _preprocess_times.append(preprocess_time_s)
     else:
         raise HTTPException(status_code=400, detail=f"Unknown X-Mode: {mode}")

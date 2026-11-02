@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Compute Week 5 and Week 6 summary statistics from results.csv."""
 import csv, statistics
 from collections import defaultdict, Counter
@@ -6,8 +6,8 @@ from pathlib import Path
 
 rows = [r for r in csv.DictReader(open('results/results.csv')) if not r.get('error')]
 
-# ── Week 5: seeds 1-3 ────────────────────────────────────────────────────────
-w5 = [r for r in rows if r.get('seed','') in ('1','2','3')]
+# -- Week 5: all rows (the CSV has no 'seed' column; old filter always returned empty) --
+w5 = rows
 print(f"Week 5 rows: {len(w5)}")
 
 bw_mode = defaultdict(list)

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 run_experiment.py
 -----------------
@@ -152,10 +152,10 @@ def validate_shaper(bw_kbps: int, no_shape: bool, probe_image: str) -> None:
 
     print(f"[validate] wire_time median={median_wt*1000:.0f}ms  "
           f"expected={expected_s*1000:.0f}ms  ratio={ratio:.2f}")
-    if ratio < 0.20:
+    if ratio < 0.50:
         raise RuntimeError(
             f"[validate] Shaper does not appear to be working: "
-            f"wire_time={median_wt*1000:.0f}ms but expected >={expected_s*1000*0.20:.0f}ms "
+            f"wire_time={median_wt*1000:.0f}ms but expected >={expected_s*1000*0.50:.0f}ms "
             f"at {bw_kbps} Kbps. Check that /scripts is mounted and tc shows a tbf qdisc."
         )
     print("[validate] Shaper OK [OK]")
@@ -191,22 +191,6 @@ def collect_images(images_dir: Path, n: int) -> list[Path]:
         images.extend(all_images)
     return images[:n]
 
-
-def run_single(
-    mode: str,
-    bw_kbps: int,
-    delay_ms: int,
-    n: int,
-    images: list[Path],
-    writer: csv.DictWriter,
-    run_id: str,
-) -> list[dict]:
-    print(f"\n{'='*60}")
-    print(f"  RUN: mode={mode}  bw={bw_kbps}Kbps  delay={delay_ms}ms  n={n}")
-    print(f"{'='*60}")
-
-    reset_policy()
-    rows = []
 
 def send_image(
     mode: str,
