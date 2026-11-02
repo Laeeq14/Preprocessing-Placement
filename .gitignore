@@ -3,7 +3,12 @@ data/images/
 data/.cache/
 
 # Experiment results — large CSVs, track manually if needed
-results/
+results/*
+!results/plots/
+!results/plots/**
+!results/validation_sweep_20.csv
+!results/phase_b_sweep.csv
+!results/phase_b_transition.csv
 
 # Python
 __pycache__/

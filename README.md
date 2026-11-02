@@ -341,14 +341,14 @@ Setup: 5 bandwidths x 3 modes x 20 COCO images = 300 requests, 0 errors. Modes w
 
 Transfer sizes were 589.2 KB/image (source) and 157.0 KB/image (destination, adaptive). The adaptive policy chose destination on all 100 requests with 0 switches.
 
-*Generated Plot:* `results/plots/phase_a_latency_vs_bandwidth.png`
+![Phase A: Latency vs. Bandwidth](results/plots/phase_a_latency_vs_bandwidth.png)
 
 **Dynamic Bandwidth Stepping & Policy Tracking Trace:**
 In the 100-request adaptive sweep across shaped bandwidth levels (5,000 -> 2,000 -> 1,000 -> 500 -> 256 Kbps):
 - **Decision Stability:** Chose `destination` 100% of the time (0 switches) because $B_{\text{dst}} < B_{\text{src}}$ throughout, avoiding 3.75× tensor inflation.
 - **Bandwidth Tracking:** The online policy EMA bandwidth estimate ($BW_{\text{est}}$) rapidly converged to each shaped rate limit.
 
-*Generated Plot:* `results/plots/phase_a_transition_trace.png`
+![Phase A: Dynamic Transition Trace](results/plots/phase_a_transition_trace.png)
 
 ### Observations
 
@@ -529,7 +529,7 @@ Source throttled at `--cpus=0.1` (`10000 100000`), testing all 6 bandwidth point
 | **25,572** | 1.67× $BW^*$ | 3,337.6 | 1,761.3 | **1,752.6** | `destination` | **100% destination** |
 | **51,144** | 3.35× $BW^*$ | 2,400.5 | 1,407.5 | **1,371.8** | `destination` | **100% destination** |
 
-*Generated Plot:* `results/plots/phase_b_latency_vs_bandwidth.png`
+![Phase B: Latency vs. Bandwidth](results/plots/phase_b_latency_vs_bandwidth.png)
 
 **2. Dynamic Bandwidth Transition Trace (`phase_b_transition.py`):**
 In a trace stepping across $BW^*$ without policy reset:
@@ -537,7 +537,7 @@ In a trace stepping across $BW^*$ without policy reset:
 - **Phase 2 (25,572 Kbps):** Detected link speed increase and cleanly switched from `source_thumbnail` to `destination` within 3 requests, remaining completely stable at `destination` without oscillation.
 - **Phase 3 (3,196 Kbps):** Successfully tracked bandwidth decrease back toward lower speeds.
 
-*Generated Plot:* `results/plots/phase_b_transition_trace.png`
+![Phase B: Dynamic Transition Trace](results/plots/phase_b_transition_trace.png)
 
 ### Limitations
 
